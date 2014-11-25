@@ -30,9 +30,15 @@
 #include "rlparse.h"
 #include "parsetree.h"
 
+/* Timing */
+#include "timing.h"
+
 using namespace std;
 ostream &operator<<( ostream &out, const NameRef &nameRef );
 ostream &operator<<( ostream &out, const NameInst &nameInst );
+
+/* Used for counting nodes in tree while walking to print progress */
+long curNode = 0; 
 
 /* Convert the literal string which comes in from the scanner into an array of
  * characters with escapes and options interpreted. Also null terminates the
@@ -85,10 +91,18 @@ char *prepareLitString( const InputLoc &loc, const char *data, long length,
 	return resData;
 }
 
+void VarDef::countTreeNodes(long & count)
+{
+	count++;
+	machineDef->countTreeNodes(count);
+}
+
+
 FsmAp *VarDef::walk( ParseData *pd )
 {
 	/* We enter into a new name scope. */
 	NameFrame nameFrame = pd->enterNameScope( true, 1 );
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 
 	/* Recurse on the expression. */
 	FsmAp *rtnVal = machineDef->walk( pd );
@@ -116,6 +130,7 @@ FsmAp *VarDef::walk( ParseData *pd )
 
 	/* Pop the name scope. */
 	pd->popNameScope( nameFrame );
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
 
@@ -487,10 +502,20 @@ void LongestMatch::transferScannerLeavingActions( FsmAp *graph )
 	}
 }
 
+void LongestMatch::countTreeNodes(long & count)
+{
+	count++;
+
+	for ( LmPartList::Iter lmi = *longestMatchList; lmi.lte(); lmi++ ) {
+		lmi->join->countTreeNodes(count);
+	}
+}
+
 FsmAp *LongestMatch::walk( ParseData *pd )
 {
 	/* The longest match has it's own name scope. */
 	NameFrame nameFrame = pd->enterNameScope( true, 1 );
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 
 	/* Make each part of the longest match. */
 	FsmAp **parts = new FsmAp*[longestMatchList->length()];
@@ -520,14 +545,30 @@ FsmAp *LongestMatch::walk( ParseData *pd )
 
 	/* Pop the name scope. */
 	pd->popNameScope( nameFrame );
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 
 	delete[] parts;
 	return rtnVal;
 }
 
+void MachineDef::countTreeNodes(long& count)
+{
+	count++;
+	switch ( type ) {
+		case JoinType:
+			join->countTreeNodes( count );
+			break;
+		case LongestMatchType:
+			longestMatch->countTreeNodes( count );
+			break;
+		case LengthDefType:
+			break;
+	}
+}
 FsmAp *MachineDef::walk( ParseData *pd )
 {
 	FsmAp *rtnVal = 0;
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	switch ( type ) {
 	case JoinType:
 		rtnVal = join->walk( pd );
@@ -541,6 +582,7 @@ FsmAp *MachineDef::walk( ParseData *pd )
 		rtnVal->concatFsm( condData->lastCondKey );
 		break;
 	}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
 
@@ -587,13 +629,25 @@ Join::Join( Expression *expr )
 	exprList.append( expr );
 }
 
+void Join::countTreeNodes(long & count)
+{
+	count++;
+	ExprList::Iter expr = exprList;
+	for ( int e = 0; e < exprList.length(); e++, expr++ )
+		expr->countTreeNodes( count );
+}
+
 /* Walk an expression node. */
 FsmAp *Join::walk( ParseData *pd )
 {
+	FsmAp *retFsm;
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	if ( exprList.length() > 1 )
-		return walkJoin( pd );
+		retFsm = walkJoin( pd );
 	else
-		return exprList.head->walk( pd );
+		retFsm = exprList.head->walk( pd );
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
+	return retFsm;
 }
 
 /* There is a list of expressions to join. */
@@ -601,6 +655,7 @@ FsmAp *Join::walkJoin( ParseData *pd )
 {
 	/* We enter into a new name scope. */
 	NameFrame nameFrame = pd->enterNameScope( true, 1 );
+	ProgressBar::printProgBar(pd->curNameInst);
 
 	/* Evaluate the machines. */
 	FsmAp **fsms = new FsmAp*[exprList.length()];
@@ -629,12 +684,14 @@ FsmAp *Join::walkJoin( ParseData *pd )
 	/* Join machines 1 and up onto machine 0. */
 	FsmAp *retFsm = fsms[0];
 	retFsm->joinOp( startId, finalId, fsms+1, exprList.length()-1 );
+	ProgressBar::printProgBar(WALKING);
 
 	/* We can now unset entry points that are not longer used. */
 	pd->unsetObsoleteEntries( retFsm );
 
 	/* Pop the name scope. */
 	pd->popNameScope( nameFrame );
+	ProgressBar::printProgBar(pd->curNameInst);
 
 	delete[] fsms;
 	return retFsm;
@@ -724,10 +781,32 @@ Expression::~Expression()
 	}
 }
 
+void Expression::countTreeNodes(long & count)
+{
+	count++;
+	switch ( type ) {
+		case OrType: 
+		case IntersectType: 
+		case SubtractType: 
+		case StrongSubtractType:
+			expression->countTreeNodes( count );
+			term->countTreeNodes( count );
+			break;
+		case TermType: {
+			term->countTreeNodes( count );
+			break;
+		}
+		case BuiltinType: {
+			break;
+		}
+	}
+}
+
 /* Evaluate a single expression node. */
 FsmAp *Expression::walk( ParseData *pd, bool lastInSeq )
 {
 	FsmAp *rtnVal = 0;
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	switch ( type ) {
 		case OrType: {
 			/* Evaluate the expression. */
@@ -787,6 +866,7 @@ FsmAp *Expression::walk( ParseData *pd, bool lastInSeq )
 		}
 	}
 
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
 
@@ -843,10 +923,29 @@ Term::~Term()
 	}
 }
 
+void Term::countTreeNodes(long & count)
+{
+	count++;
+	switch ( type ) {
+		case ConcatType:
+		case RightStartType:
+		case RightFinishType:
+		case LeftType:
+			term->countTreeNodes( count );
+			factorWithAug->countTreeNodes( count );
+			break;
+		case FactorWithAugType: {
+			factorWithAug->countTreeNodes( count );
+			break;
+		}
+	}
+}
+
 /* Evaluate a term node. */
 FsmAp *Term::walk( ParseData *pd, bool lastInSeq )
 {
 	FsmAp *rtnVal = 0;
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	switch ( type ) {
 		case ConcatType: {
 			/* Evaluate the Term. */
@@ -923,10 +1022,10 @@ FsmAp *Term::walk( ParseData *pd, bool lastInSeq )
 			FsmAp *rhs = factorWithAug->walk( pd );
 
 			/* Set up the priority descriptors. The left machine gets the
-			 * higher priority. */
+			 * higher priority. *
 			priorDescs[0].key = pd->nextPriorKey++;
 			priorDescs[0].priority = 1;
-			rtnVal->allTransPrior( pd->curPriorOrd++, &priorDescs[0] );
+			rtnVal->allTransPrior( pd->curPriorOrd++, &priorDescs[0] );*/
 
 			/* The right machine gets the lower priority. We cannot use
 			 * allTransPrior here in case the start state of the right machine
@@ -947,6 +1046,7 @@ FsmAp *Term::walk( ParseData *pd, bool lastInSeq )
 			break;
 		}
 	}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
 
@@ -1182,12 +1282,18 @@ void FactorWithAug::assignConditions( FsmAp *graph )
 	}
 }
 
+void FactorWithAug::countTreeNodes(long & count)
+{
+	count++;
+	factorWithRep->countTreeNodes( count );
+}
 
 /* Evaluate a factor with augmentation node. */
 FsmAp *FactorWithAug::walk( ParseData *pd )
 {
 	/* Enter into the scopes created for the labels. */
 	NameFrame nameFrame = pd->enterNameScope( false, labels.length() );
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 
 	/* Make the array of function orderings. */
 	int *actionOrd = 0;
@@ -1284,6 +1390,7 @@ FsmAp *FactorWithAug::walk( ParseData *pd )
 
 		pd->popNameScope( nameFrame );
 	}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 
 	if ( priorOrd != 0 )
 		delete[] priorOrd;
@@ -1382,9 +1489,44 @@ FactorWithRep::~FactorWithRep()
 	}
 }
 
+void FactorWithRep::countTreeNodes(long & count)
+{
+	count++;
+	switch ( type ) {
+		case StarType:
+		case StarStarType:
+		case OptionalType:
+		case PlusType:
+		case MinType:
+			factorWithRep->countTreeNodes( count );
+			break;
+		case ExactType:
+			if (lowerRep != 0) {
+				factorWithRep->countTreeNodes( count );
+			}
+			break;
+		case MaxType:
+			if (upperRep != 0) {
+				factorWithRep->countTreeNodes( count );
+			}
+			break;
+		case RangeType: 
+			/* Check for bogus range. */
+			if (!(( upperRep - lowerRep < 0 ) ||
+				( lowerRep == 0 && upperRep == 0 ))) {
+			factorWithRep->countTreeNodes( count );
+			}
+			break;
+		case FactorWithNegType:
+			factorWithNeg->countTreeNodes( count );
+			break;
+	}
+}
+
 /* Evaluate a factor with repetition node. */
 FsmAp *FactorWithRep::walk( ParseData *pd )
 {
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	FsmAp *retFsm = 0;
 
 	switch ( type ) {
@@ -1622,6 +1764,7 @@ FsmAp *FactorWithRep::walk( ParseData *pd )
 		retFsm = factorWithNeg->walk( pd );
 		break;
 	}}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return retFsm;
 }
 
@@ -1677,9 +1820,24 @@ FactorWithNeg::~FactorWithNeg()
 	}
 }
 
+void FactorWithNeg::countTreeNodes(long & count)
+{
+	count++;
+	switch ( type ) {
+		case NegateType:
+		case CharNegateType:
+			factorWithNeg->countTreeNodes( count );
+			break;
+		case FactorType:
+			factor->countTreeNodes( count );
+			break;
+	}
+}
+
 /* Evaluate a factor with negation node. */
 FsmAp *FactorWithNeg::walk( ParseData *pd )
 {
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	FsmAp *retFsm = 0;
 
 	switch ( type ) {
@@ -1708,6 +1866,7 @@ FsmAp *FactorWithNeg::walk( ParseData *pd )
 		retFsm = factor->walk( pd );
 		break;
 	}}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return retFsm;
 }
 
@@ -1764,9 +1923,38 @@ Factor::~Factor()
 	}
 }
 
+void Factor::countTreeNodes(long & count )
+{
+	count++;
+	switch ( type ) {
+		case LiteralType:
+			literal->countTreeNodes( count );
+			break;
+		case RangeType:
+			range->countTreeNodes( count );
+			break;
+		case OrExprType:
+			reItem->countTreeNodes( count );
+			break;
+		case RegExprType:
+			regExpr->countTreeNodes( count );
+			break;
+		case ReferenceType:
+			varDef->countTreeNodes( count );
+			break;
+		case ParenType:
+			join->countTreeNodes( count );
+			break;
+		case LongestMatchType:
+			longestMatch->countTreeNodes( count );
+			break;
+	}
+}
+
 /* Evaluate a factor node. */
 FsmAp *Factor::walk( ParseData *pd )
 {
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	FsmAp *rtnVal = 0;
 	switch ( type ) {
 	case LiteralType:
@@ -1792,6 +1980,7 @@ FsmAp *Factor::walk( ParseData *pd )
 		break;
 	}
 
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
 
@@ -1842,9 +2031,17 @@ Range::~Range()
 	delete upperLit;
 }
 
+void Range::countTreeNodes(long & count)
+{
+	count++;
+	lowerLit->countTreeNodes( count );
+	upperLit->countTreeNodes( count );
+}
+
 /* Evaluate a range. Gets the lower an upper key and makes an fsm range. */
 FsmAp *Range::walk( ParseData *pd )
 {
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	/* Construct and verify the suitability of the lower end of the range. */
 	FsmAp *lowerFsm = lowerLit->walk( pd );
 	if ( !lowerFsm->checkSingleCharMachine() ) {
@@ -1875,12 +2072,19 @@ FsmAp *Range::walk( ParseData *pd )
 	/* Return the range now that it is validated. */
 	FsmAp *retFsm = new FsmAp();
 	retFsm->rangeFsm( lowKey, highKey );
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return retFsm;
+}
+
+void Literal::countTreeNodes(long & count) 
+{
+	count++;
 }
 
 /* Evaluate a literal object. */
 FsmAp *Literal::walk( ParseData *pd )
 {
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	/* FsmAp to return, is the alphabet signed. */
 	FsmAp *rtnVal = 0;
 
@@ -1912,6 +2116,7 @@ FsmAp *Literal::walk( ParseData *pd )
 		delete[] arr;
 		break;
 	}}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
 
@@ -1928,9 +2133,25 @@ RegExpr::~RegExpr()
 	}
 }
 
+void RegExpr::countTreeNodes(long & count)
+{
+	count++;
+	switch (type) {
+		case RecurseItem: {
+			regExpr->countTreeNodes( count );
+		item->countTreeNodes( count );
+			break;
+		}
+		case Empty: {
+			break;
+		}
+	}
+}
+
 /* Evaluate a regular expression object. */
 FsmAp *RegExpr::walk( ParseData *pd, RegExpr *rootRegex )
 {
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	/* This is the root regex, pass down a pointer to this. */
 	if ( rootRegex == 0 )
 		rootRegex = this;
@@ -1950,6 +2171,7 @@ FsmAp *RegExpr::walk( ParseData *pd, RegExpr *rootRegex )
 			break;
 		}
 	}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
 
@@ -1967,9 +2189,24 @@ ReItem::~ReItem()
 	}
 }
 
+void ReItem::countTreeNodes(long & count)
+{
+	count++;
+	switch ( type ) {
+		case Data:
+		case Dot:
+			break;
+		case OrBlock:
+		case NegOrBlock:
+			orBlock->countTreeNodes(count);
+			break;
+	}
+}
+
 /* Evaluate a regular expression object. */
 FsmAp *ReItem::walk( ParseData *pd, RegExpr *rootRegex )
 {
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	/* The fsm to return, is the alphabet signed? */
 	FsmAp *rtnVal = 0;
 
@@ -2026,6 +2263,7 @@ FsmAp *ReItem::walk( ParseData *pd, RegExpr *rootRegex )
 		rtnVal->starOp();
 		rtnVal->minimizePartition2();
 	}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
 
@@ -2042,10 +2280,22 @@ ReOrBlock::~ReOrBlock()
 	}
 }
 
+void ReOrBlock::countTreeNodes(long & count) {
+	count++;
+	switch ( type ) {
+		case RecurseItem:
+			orBlock->countTreeNodes( count );
+			item->countTreeNodes( count );
+			break;
+		case Empty:
+			break;
+	}
+}
 
 /* Evaluate an or block of a regular expression. */
 FsmAp *ReOrBlock::walk( ParseData *pd, RegExpr *rootRegex )
 {
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	FsmAp *rtnVal = 0;
 	switch ( type ) {
 		case RecurseItem: {
@@ -2065,13 +2315,20 @@ FsmAp *ReOrBlock::walk( ParseData *pd, RegExpr *rootRegex )
 			break;
 		}
 	}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;;
+}
+
+void ReOrItem::countTreeNodes(long & count )
+{
+	count++;
 }
 
 /* Evaluate an or block item of a regular expression. */
 FsmAp *ReOrItem::walk( ParseData *pd, RegExpr *rootRegex )
 {
 	/* The return value, is the alphabet signed? */
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	FsmAp *rtnVal = 0;
 	switch ( type ) {
 	case Data: {
@@ -2135,5 +2392,6 @@ FsmAp *ReOrItem::walk( ParseData *pd, RegExpr *rootRegex )
 
 		break;
 	}}
+	ProgressBar::printProgBar(100*((double) curNode++ / (numTreeNodes*2)),pd->curNameInst,WALKING);
 	return rtnVal;
 }
